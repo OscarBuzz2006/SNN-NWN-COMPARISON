@@ -1,0 +1,125 @@
+import torch, torch.nn as nn
+import snntorch as snn
+import snntorch.spikegen as spikegen
+
+# Training Parameters
+batch_size=128
+data_path='/tmp/data/mnist'
+num_classes = 10  # MNIST has 10 output classes
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else torch.device("cpu")
+
+# Testing and training data
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+# Define a transform
+transform = transforms.Compose([
+            transforms.Resize((28, 28)),
+            transforms.Grayscale(),
+            transforms.ToTensor(),
+            transforms.Normalize((0,), (1,))])
+
+fmnist_train = datasets.FashionMNIST(data_path, train=True, download=True, transform=transform)
+fmnist_test = datasets.FashionMNIST(data_path, train=False, download=True, transform=transform)
+
+# Create DataLoaders
+train_loader = DataLoader(fmnist_train, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(fmnist_test, batch_size=batch_size, shuffle=True)
+
+
+
+## REQUIRED POPULATION CODING ##
+
+
+def powerlaw_conv(data, alpha=1.5, min_val=1e-6):
+    clipped_data = torch.clamp(data, min=min_val, max=1.0)
+    uniform_random = torch.rand_like(clipped_data)
+    
+    if alpha != 1.0:
+        powerlaw_samples = (1 - uniform_random) ** (-1/(alpha - 1))
+    else:
+        powerlaw_samples = -torch.log(uniform_random)
+    
+    # FIXED: Use data as spike probability directly with power-law modulation
+    spike_probability = clipped_data * torch.clamp(powerlaw_samples / powerlaw_samples.max(), 0, 1)
+    spike_data = torch.bernoulli(spike_probability)
+    
+    return spike_data
+
+def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
+    """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
+    
+    Args:
+        data: Input tensor
+        num_steps: Number of time steps
+        method: 'poisson' (original) or 'powerlaw' (critical)
+        **kwargs: Additional arguments for power-law generation
+    
+    Returns:
+        Spike tensor with chosen statistics
+    """
+    # Repeat data across time dimension
+    time_data = data.repeat(tuple([num_steps] + [1] * len(data.shape)))
+    
+    if method == 'poisson':
+        # Original snnTorch behavior
+        spike_data = torch.bernoulli(torch.clamp(time_data, 0, 1))
+    elif method == 'powerlaw':
+        # Your critical avalanche modification
+        spike_data = powerlaw_conv(time_data, **kwargs)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    return spike_data
+
+
+## OPTIONAL ... RATE CODING ##
+
+
+
+## MAIN IMPLEMENTATION ##
+
+if __name__ == "__main__":
+    # Example: MNIST pixel values
+    # Use only a small batch for encoding
+    mnist_data = fmnist_train.data[:100].float() / 255.0  # Only 100 subsamples
+    # Extract a sample of digits (e.g., one of each class)
+    sample_images = []
+    sample_labels = []
+    num_samples_per_class = 1
+
+    for i in range(len(fmnist_train)):
+        img, label = fmnist_train[i]
+        if label not in sample_labels:
+            sample_images.append(img)
+            sample_labels.append(label)
+            if len(sample_labels) == 10: # Got one of each class
+                break
+    
+    # Original Poisson encoding
+    poisson_spikes = modified_rate_encoding(mnist_data, num_steps=100, method='poisson')
+    
+    # Power-law encoding for critical avalanches  
+    critical_spikes = modified_rate_encoding(mnist_data, num_steps=100, 
+                                           method='powerlaw', alpha=1.5)
+    
+
+    print("Poisson spikes shape:", poisson_spikes.shape)
+    print("Critical spikes shape:", critical_spikes.shape)
+
+    # Print a small slice for inspection
+    print("Poisson spikes (first 2 time steps, first sample):")
+    print(poisson_spikes[:2, 0])
+
+    print("Critical spikes (first 2 time steps, first sample):")
+    print(critical_spikes[:2, 0])
+
+    # Print summary statistics
+    print("Poisson spikes - mean:", poisson_spikes.float().mean().item(), "sum:", poisson_spikes.sum().item())
+    print("Critical spikes - mean:", critical_spikes.float().mean().item(), "sum:", critical_spikes.sum().item())
+
+    # Optional: visualize a spike train as an image (requires matplotlib)
+    import matplotlib.pyplot as plt
+    plt.imshow(poisson_spikes[:,0].reshape(-1, 28*28), aspect='auto')
+    plt.title("Poisson spikes for first sample")
+    plt.show()
