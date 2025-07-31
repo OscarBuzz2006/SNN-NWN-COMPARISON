@@ -1,6 +1,11 @@
 import torch, torch.nn as nn
 import snntorch as snn
 import snntorch.spikegen as spikegen
+import matplotlib.pyplot as plt
+import snntorch.spikeplot as splt
+from IPython.display import HTML, display
+import matplotlib
+matplotlib.rcParams['animation.writer'] = 'pillow'
 
 # Training Parameters
 batch_size=128
@@ -13,19 +18,18 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device('mp
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-# Define a transform
+# Use MNIST instead of FashionMNIST, and remove extra normalization
 transform = transforms.Compose([
-            transforms.Resize((28, 28)),
-            transforms.Grayscale(),
-            transforms.ToTensor(),
-            transforms.Normalize((0,), (1,))])
+    transforms.Resize((28, 28)),
+    transforms.Grayscale(),
+    transforms.ToTensor()
+])
 
-fmnist_train = datasets.FashionMNIST(data_path, train=True, download=True, transform=transform)
-fmnist_test = datasets.FashionMNIST(data_path, train=False, download=True, transform=transform)
+mnist_train = datasets.MNIST(data_path, train=True, download=True, transform=transform)
+mnist_test = datasets.MNIST(data_path, train=False, download=True, transform=transform)
 
-# Create DataLoaders
-train_loader = DataLoader(fmnist_train, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(fmnist_test, batch_size=batch_size, shuffle=True)
+train_loader = DataLoader(mnist_train, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
 
 
 
@@ -41,8 +45,10 @@ def powerlaw_conv(data, alpha=1.5, min_val=1e-6):
     else:
         powerlaw_samples = -torch.log(uniform_random)
     
-    # FIXED: Use data as spike probability directly with power-law modulation
-    spike_probability = clipped_data * torch.clamp(powerlaw_samples / powerlaw_samples.max(), 0, 1)
+    # Rescale powerlaw_samples to [0, 1]
+    powerlaw_samples = (powerlaw_samples - powerlaw_samples.min()) / (powerlaw_samples.max() - powerlaw_samples.min() + 1e-8)
+    spike_probability = clipped_data * powerlaw_samples
+    spike_probability = torch.clamp(spike_probability, 0, 1)
     spike_data = torch.bernoulli(spike_probability)
     
     return spike_data
@@ -82,14 +88,16 @@ def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
 if __name__ == "__main__":
     # Example: MNIST pixel values
     # Use only a small batch for encoding
-    mnist_data = fmnist_train.data[:100].float() / 255.0  # Only 100 subsamples
+    # mnist_data = fmnist_train.data[:100].float() / 255.0  # Only 100 subsamples
+    mnist_data = mnist_train.data[0].unsqueeze(0).float()  # shape: [1, 28, 28]
+    
     # Extract a sample of digits (e.g., one of each class)
     sample_images = []
     sample_labels = []
     num_samples_per_class = 1
 
-    for i in range(len(fmnist_train)):
-        img, label = fmnist_train[i]
+    for i in range(len(mnist_train)):
+        img, label = mnist_train[i]
         if label not in sample_labels:
             sample_images.append(img)
             sample_labels.append(label)
@@ -118,8 +126,38 @@ if __name__ == "__main__":
     print("Poisson spikes - mean:", poisson_spikes.float().mean().item(), "sum:", poisson_spikes.sum().item())
     print("Critical spikes - mean:", critical_spikes.float().mean().item(), "sum:", critical_spikes.sum().item())
 
-    # Optional: visualize a spike train as an image (requires matplotlib)
-    import matplotlib.pyplot as plt
-    plt.imshow(poisson_spikes[:,0].reshape(-1, 28*28), aspect='auto')
-    plt.title("Poisson spikes for first sample")
+    # Use a single MNIST digit
+    img, label = mnist_train[0]
+    img = img.squeeze()  # shape: [28, 28]
+    img_flat = img.view(-1)  # shape: [784]
+
+    num_steps = 100
+    poisson_spikes = modified_rate_encoding(img_flat.unsqueeze(0), num_steps=num_steps, method='poisson')
+    critical_spikes = modified_rate_encoding(img_flat.unsqueeze(0), num_steps=num_steps, method='powerlaw', alpha=1.5)
+
+    from matplotlib.animation import PillowWriter
+    from IPython.display import Image
+
+    # Poisson GIF and raster
+    fig, ax = plt.subplots()
+    anim = splt.animator(poisson_spikes[:, 0].view(num_steps, 28, 28), fig, ax)
+    anim.save("poisson.gif", writer=PillowWriter(fps=10))
+    display(Image(filename="poisson.gif"))
+    plt.close(fig)
+
+    fig, ax = plt.subplots()
+    splt.raster(poisson_spikes[:, 0], ax, s=0.5)
+    ax.set_title("Poisson Raster Plot")
+    plt.show()
+
+    # Critical GIF and raster
+    fig, ax = plt.subplots()
+    anim = splt.animator(critical_spikes[:, 0].view(num_steps, 28, 28), fig, ax)
+    anim.save("critical.gif", writer=PillowWriter(fps=10))
+    display(Image(filename="critical.gif"))
+    plt.close(fig)
+
+    fig, ax = plt.subplots()
+    splt.raster(critical_spikes[:, 0], ax, s=0.5)
+    ax.set_title("Critical Raster Plot")
     plt.show()
