@@ -1,0 +1,133 @@
+import torch
+import matplotlib.pyplot as plt
+from PIL import Image
+import snntorch.spikeplot as splt
+from matplotlib.animation import PillowWriter
+
+# Training Parameters
+batch_size=128
+data_path='/tmp/data/mnist'
+num_classes = 10  # MNIST has 10 output classes
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else torch.device("cpu")
+
+# Testing and training data
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+transform = transforms.Compose([
+    transforms.Resize((28, 28)),
+    transforms.Grayscale(),
+    transforms.ToTensor()
+])
+
+mnist_train = datasets.MNIST(data_path, train=True, download=True, transform=transform)
+mnist_test = datasets.MNIST(data_path, train=False, download=True, transform=transform)
+
+train_loader = DataLoader(mnist_train, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
+
+
+
+## REQUIRED POPULATION CODING ##
+
+
+def powerlaw_conv(data, alpha=1.5, min_val=1e-7):
+    uniform_random = torch.rand_like(data)
+    
+    if alpha != 1.0:
+        powerlaw_samples = (1 - uniform_random) ** (-1/(alpha - 1))
+    else:
+        powerlaw_samples = -torch.log(uniform_random)
+    
+    # FIXED: Use power-law samples directly as modulation (don't rescale)
+    spike_probability = data * torch.clamp(1.0 / powerlaw_samples, 0, 2)  # Invert for proper weighting
+    spike_probability = torch.clamp(spike_probability, 0, 1)
+    spike_data = torch.bernoulli(spike_probability)
+    
+    return spike_data
+
+def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
+    """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
+    
+    Args:
+        data: Input tensor
+        num_steps: Number of time steps
+        method: 'poisson' (original) or 'powerlaw' (critical)
+        **kwargs: Additional arguments for power-law generation
+    
+    Returns:
+        Spike tensor with chosen statistics
+    """
+    # Repeat data across time dimension
+    time_data = data.repeat(tuple([num_steps] + [1] * len(data.shape)))
+    
+    if method == 'poisson':
+        # Original snnTorch behavior
+        spike_data = torch.bernoulli(torch.clamp(time_data, 0, 1))
+    elif method == 'powerlaw':
+        # Your critical avalanche modification
+        spike_data = powerlaw_conv(time_data, **kwargs)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    return spike_data
+
+
+
+
+# Extract a sample of digits (e.g., one of each class)
+sample_images = []
+sample_labels = []
+num_samples_per_class = 1
+
+for i in range(len(mnist_train)):
+    img, label = mnist_train[i]
+    if label not in sample_labels:
+        sample_images.append(img)
+        sample_labels.append(label)
+        if len(sample_labels) == 10:  # Got one of each class
+            break
+
+print(f"Collected {len(sample_images)} sample images with labels: {sample_labels}")
+
+# Process each collected sample image
+for i, (img, label) in enumerate(zip(sample_images, sample_labels)):
+    print(f"\nProcessing Digit {label} (Image {i+1}/10)...")
+    
+    # Prepare image data
+    img_flat = img.squeeze().view(-1)  # shape: [784]
+    num_steps = 50
+    
+    # Original Poisson encoding
+    poisson_spikes = modified_rate_encoding(img_flat.unsqueeze(0), 
+                                           num_steps=num_steps, method='poisson')
+    
+    # Power-law encoding for critical avalanches  
+    critical_spikes = modified_rate_encoding(img_flat.unsqueeze(0), 
+                                           num_steps=num_steps, 
+                                           method='powerlaw', alpha=1.5)
+    
+    print(f"  Poisson  - mean: {poisson_spikes.float().mean().item():.6f}, sum: {poisson_spikes.sum().item()}")
+    print(f"  Critical - mean: {critical_spikes.float().mean().item():.6f}, sum: {critical_spikes.sum().item()}")
+    
+    # Create GIFs for this digit
+    
+    # Poisson GIF
+    fig, ax = plt.subplots()
+    ax.set_title(f'Poisson Encoding - Digit {label}')
+    anim = splt.animator(poisson_spikes[:, 0].view(num_steps, 28, 28), fig, ax)
+    anim.save(f"poisson_digit_{label}.gif", writer=PillowWriter(fps=10))
+    plt.close(fig)
+    
+    # Critical GIF  
+    fig, ax = plt.subplots()
+    ax.set_title(f'Critical Encoding - Digit {label}')
+    anim = splt.animator(critical_spikes[:, 0].view(num_steps, 28, 28), fig, ax)
+    anim.save(f"critical_digit_{label}.gif", writer=PillowWriter(fps=10))
+    plt.close(fig)
+    
+    print(f"  Generated: poisson_digit_{label}.gif and critical_digit_{label}.gif")
+
+print(f"\nGenerated 20 GIF files total:")
+print("- 10 Poisson encoding GIFs (poisson_digit_X.gif)")  
+print("- 10 Critical encoding GIFs (critical_digit_X.gif)")
