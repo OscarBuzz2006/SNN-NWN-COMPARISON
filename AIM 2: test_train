@@ -7,6 +7,11 @@ from snntorch import utils
 import numpy as np
 from collections import Counter
 import matplotlib.pyplot as plt
+import powerlaw
+
+# Testing and training data
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 
 # Training Parameters
 batch_size=128
@@ -15,13 +20,8 @@ num_classes = 10  # MNIST has 10 output classes
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else torch.device("cpu")
 
-# Testing and training data
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-
 transform = transforms.Compose([
     transforms.Resize((28, 28)),
-    transforms.Grayscale(),
     transforms.ToTensor()
 ])
 
@@ -32,20 +32,15 @@ train_loader = DataLoader(mnist_train, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
 
 
-
 ## REQUIRED POPULATION CODING ##
 
-
-def powerlaw_conv(data, alpha=1.5, min_val=1e-7):
+def powerlaw_conv(data, alpha=1.5):
     uniform_random = torch.rand_like(data)
     
-    if alpha != 1.0:
-        powerlaw_samples = (1 - uniform_random) ** (-1/(alpha - 1))
-    else:
-        powerlaw_samples = -torch.log(uniform_random)
+    powerlaw_samples = -torch.log(uniform_random)
     
     # FIXED: Use power-law samples directly as modulation (don't rescale)
-    spike_probability = data * torch.clamp(1.0 / powerlaw_samples, 0, 2)  # Invert for proper weighting
+    spike_probability = data * torch.clamp(1.0 / powerlaw_samples, 0, 2)
     spike_probability = torch.clamp(spike_probability, 0, 1)
     spike_data = torch.bernoulli(spike_probability)
     
@@ -54,12 +49,6 @@ def powerlaw_conv(data, alpha=1.5, min_val=1e-7):
 def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
     """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
     
-    Args:
-        data: Input tensor
-        num_steps: Number of time steps
-        method: 'poisson' (original) or 'powerlaw' (critical)
-        **kwargs: Additional arguments for power-law generation
-    
     Returns:
         Spike tensor with chosen statistics
     """
@@ -67,7 +56,7 @@ def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
     time_data = data.repeat(tuple([num_steps] + [1] * len(data.shape)))
     
     if method == 'poisson':
-        # Original snnTorch behavior
+        # Original snnTorch behavior, SAME AS THE RATE_CONV() FUNCTION
         spike_data = torch.bernoulli(torch.clamp(time_data, 0, 1))
     elif method == 'powerlaw':
         # Your critical avalanche modification
@@ -76,9 +65,9 @@ def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
         raise ValueError(f"Unknown method: {method}")
     return spike_data
 
-##ABOVE IS COPIED FROM SNN_MNIST_samples.PY FOR DATA LOADING AND MODIFICATION; BELOW IS THE CORE SNN TRAINING AND TESTING CODE##
+##ABOVE IS COPIED FROM SNN_MNIST_samples.PY (spike visualisation) FOR DATA LOADING AND MODIFICATION; BELOW IS THE CORE SNN TRAINING AND TESTING CODE##
 
-# Test accuracy function with proper time-step handling
+# Test accuracy function FROM SNNTORCH, MODIFIED FOR MANUAL POPULATION CODING
 def test_accuracy(test_loader, net, num_steps, population_code=True, num_classes=10):
     with torch.no_grad():
         net.eval()
@@ -88,11 +77,11 @@ def test_accuracy(test_loader, net, num_steps, population_code=True, num_classes
             data = data.to(device)
             targets = targets.to(device)
             
+        
             # POWER-LAW ENCODING - returns [num_steps, batch_size, features]
             spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
                                               num_steps=num_steps, 
-                                              method='powerlaw', 
-                                              alpha=1.5)
+                                              method='poisson')
             
             
             # Forward pass with proper time-step handling
@@ -130,9 +119,14 @@ def forward_pass(net, spike_data):
     return torch.stack(spk_rec), torch.stack(mem_rec)
 
 # TRAINING OPTION 1: Custom training loop with explicit power-law encoding
-def train_powerlaw_population(net, train_loader, num_epochs=5):
-    print("Training with Poisson Population Coding (Option 1)")
+def train_powerlaw_population(net, train_loader, num_epochs=5, num_steps=10, num_classes=10):
+    print("Training with PL Population Coding (Option 1)")
     print("="*60)
+
+    # Define loss function and optimizer inside this function
+    loss_fn = SF.mse_count_loss(correct_rate=1.0, incorrect_rate=0.0,
+                                population_code=True, num_classes=num_classes)
+    optimizer = torch.optim.Adam(net.parameters(), lr=2e-3, betas=(0.9, 0.999))
     
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
@@ -144,11 +138,11 @@ def train_powerlaw_population(net, train_loader, num_epochs=5):
             data = data.to(device)
             targets = targets.to(device)
             
+            
             # POWER-LAW ENCODING - returns [num_steps, batch_size, features]
             spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
                                               num_steps=num_steps, 
-                                              method='powerlaw', 
-                                              alpha=1.5)
+                                              method='poisson')
             
             # Forward pass with proper time handling
             spk_rec, mem_rec = forward_pass(net, spike_data)
@@ -182,253 +176,65 @@ def train_powerlaw_population(net, train_loader, num_epochs=5):
     return net
 
 
-# Network parameters (from tutorial)
-num_inputs = 28*28
-num_hidden = 128
-num_outputs = 10
-num_steps = 10
-
-# Spiking neuron parameters
-beta = 0.9  # neuron decay rate 
-grad = surrogate.fast_sigmoid()
-
-# Population coding setup - 500 output neurons, 50 per class
-pop_outputs = 500
-
-# Build the population coding network (exact tutorial structure)
-net_pop = nn.Sequential(nn.Flatten(),
-                        nn.Linear(num_inputs, num_hidden),
-                        snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True),
-                        nn.Linear(num_hidden, pop_outputs),
-                        snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True, output=True)
-                        ).to(device)
-
-print("Network Architecture:")
-print(net_pop)
-print(f"Population coding: {pop_outputs} output neurons, {pop_outputs//num_classes} neurons per class")
-
-# Loss function and optimizer (from tutorial)
-loss_fn = SF.mse_count_loss(correct_rate=1.0, incorrect_rate=0.0, 
-                           population_code=True, num_classes=num_classes)
-optimizer = torch.optim.Adam(net_pop.parameters(), lr=2e-3, betas=(0.9, 0.999))
-# Run the training
-print("Training Poisson Population Coding SNN...")
-print(f"Using {device}")
-print(f"Time steps: {num_steps}")
-
-# Train the network
-trained_net = train_powerlaw_population(net_pop, train_loader, num_epochs=5)
-
-print("\nTraining completed!")
-
-# Final evaluation
-print("\nFinal Results:")
-final_accuracy = test_accuracy(test_loader, trained_net, num_steps, 
-                             population_code=True, num_classes=num_classes)
-print(f"Final Test Accuracy with Poisson Population Coding: {final_accuracy*100:.3f}%")
-
-def detect_spike_bursts_simple(spike_data):
+def train_population_coding_snn(train_loader, test_loader, device, num_classes=10):
     """
-    Simple burst detection for criticality analysis
-    
-    Args:
-        spike_data: [num_steps, batch_size, neurons] or [num_steps, neurons]
-    
+    Train a population coding spiking neural network.
+        
     Returns:
-        List of burst durations
+        trained_net: The trained network
+        final_accuracy: Final test accuracy
     """
-    # If batch dimension exists, sum over batch and neurons for population activity
-    if len(spike_data.shape) == 3:
-        activity = spike_data.sum(dim=(1, 2))  # [num_steps]
-    else:
-        activity = spike_data.sum(dim=1)  # [num_steps]
     
-    # Convert to binary: active (>0) or silent (=0)
-    active_bins = (activity > 0).int()
+    # Network parameters (from tutorial)
+    num_inputs = 28*28
+    num_hidden = 128
+    num_outputs = 10
+    num_steps = 10
     
-    # Detect bursts (continuous periods of activity)
-    burst_durations = []
-    in_burst = False
-    current_duration = 0
+    # Spiking neuron parameters
+    beta = 0.9  # neuron decay rate
+    grad = surrogate.fast_sigmoid()  # surrogate gradient
     
-    for t in range(len(active_bins)):
-        if active_bins[t] > 0 and not in_burst:
-            # Start of new burst
-            in_burst = True
-            current_duration = 1
-        elif active_bins[t] > 0 and in_burst:
-            # Continue burst
-            current_duration += 1
-        elif active_bins[t] == 0 and in_burst:
-            # End of burst
-            in_burst = False
-            if current_duration > 0:
-                burst_durations.append(current_duration)
-            current_duration = 0
+    # Population coding setup - 500 output neurons, 50 per class
+    pop_outputs = 500
     
-    # Handle case where data ends during a burst
-    if in_burst and current_duration > 0:
-        burst_durations.append(current_duration)
+    # Build the population coding network (exact tutorial structure)
+    net_pop = nn.Sequential(nn.Flatten(),
+                            nn.Linear(num_inputs, num_hidden),
+                            snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True),
+                            nn.Linear(num_hidden, pop_outputs),
+                            snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True, output=True)
+                            ).to(device)
     
-    return burst_durations
+    utils.reset(net_pop)  # Clear retained hidden states
+    
+    print("Network Architecture:")
+    print(net_pop)
+    print(f"Population coding: {pop_outputs} output neurons, {pop_outputs//num_classes} neurons per class")
+    
+    # Loss function and optimizer (from tutorial)
+    loss_fn = SF.mse_count_loss(correct_rate=1.0, incorrect_rate=0.0,
+                                population_code=True, num_classes=num_classes)
+    optimizer = torch.optim.Adam(net_pop.parameters(), lr=2e-3, betas=(0.9, 0.999))
+    
+    print("Training PL Population Coding SNN...")
+    print(f"Time steps: {num_steps}")
+    
+    # Train the network
+    trained_net = train_powerlaw_population(net_pop, train_loader, num_epochs=5, num_steps=num_steps)
+    
+    print("\nTraining completed!")
+    
+    # Final evaluation
+    print("\nFinal Results:")
+    final_accuracy = test_accuracy(test_loader, trained_net, num_steps,
+                                  population_code=True, num_classes=num_classes)
+    print(f"Final Test Accuracy with PL Population Coding: {final_accuracy*100:.3f}%")
+    
+    return trained_net, final_accuracy
 
-def plot_criticality_analysis(spike_data, title="Criticality Analysis", save_path=None):
-    """
-    Plot burst duration vs frequency to assess criticality
-    
-    Args:
-        spike_data: Spike tensor from your network
-        title: Plot title
-        save_path: Optional path to save plot
-    """
-    # Detect burst durations
-    burst_durations = detect_spike_bursts_simple(spike_data)
-    
-    if len(burst_durations) == 0:
-        print("No bursts detected in spike data!")
-        return
-    
-    # Count frequency of each duration
-    duration_counts = Counter(burst_durations)
-    durations = sorted(duration_counts.keys())
-    frequencies = [duration_counts[d] for d in durations]
-    
-    # Create log-log plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    
-    # Linear plot
-    ax1.bar(durations, frequencies, alpha=0.7, color='blue')
-    ax1.set_xlabel('Burst Duration (time steps)')
-    ax1.set_ylabel('Frequency')
-    ax1.set_title(f'{title} - Linear Scale')
-    ax1.grid(True, alpha=0.3)
-    
-    # Log-log plot for power-law detection
-    ax2.loglog(durations, frequencies, 'o-', color='red', markersize=8, linewidth=2)
-    ax2.set_xlabel('Log Burst Duration')
-    ax2.set_ylabel('Log Frequency')
-    ax2.set_title(f'{title} - Log-Log Scale')
-    ax2.grid(True, alpha=0.3)
-    
-    # Fit power law in log space for criticality assessment
-    if len(durations) > 3:
-        log_durations = np.log10(durations)
-        log_frequencies = np.log10(frequencies)
-        
-        # Linear fit in log space: log(y) = -α * log(x) + const
-        slope, intercept = np.polyfit(log_durations, log_frequencies, 1)
-        
-        # Plot fit line
-        fit_line = 10**(slope * log_durations + intercept)
-        ax2.plot(durations, fit_line, '--', color='black', linewidth=2, 
-                label=f'Power law fit: α = {-slope:.2f}')
-        ax2.legend()
-        
-        # Criticality assessment
-        critical_alpha = 2.0  # Theoretical value for critical avalanches
-        print(f"\nCriticality Analysis for {title}:")
-        print(f"Power-law exponent (α): {-slope:.3f}")
-        print(f"Theoretical critical value: {critical_alpha:.1f}")
-        print(f"Distance from criticality: {abs(-slope - critical_alpha):.3f}")
-        
-        if abs(-slope - critical_alpha) < 0.3:
-            print("✓ Close to critical state!")
-        elif -slope > critical_alpha:
-            print("⚠ Sub-critical (too stable)")
-        else:
-            print("⚠ Super-critical (too excitable)")
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Plot saved to {save_path}")
-    
-    plt.show()
-    
-    # Print basic statistics
-    print(f"\nBurst Statistics:")
-    print(f"Total bursts detected: {len(burst_durations)}")
-    print(f"Mean burst duration: {np.mean(burst_durations):.2f}")
-    print(f"Max burst duration: {max(burst_durations)}")
-    print(f"Min burst duration: {min(burst_durations)}")
-    
-    return burst_durations, durations, frequencies
 
-# Example usage with your power-law network data
-def evaluate_network_criticality(net, test_loader, num_steps=25):
-    """
-    Evaluate criticality of your trained network
-    """
-    print("Evaluating Network Criticality...")
-    
-    # Get some test data
-    with torch.no_grad():
-        net.eval()
-        
-        # Collect spike data from multiple batches
-        all_spike_data = []
-        
-        for batch_idx, (data, targets) in enumerate(test_loader):
-            if batch_idx >= 5:  # Just use 5 batches for analysis
-                break
-                
-            data = data.to(device)
-            
-            # Power-law encoding
-            spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
-                                              num_steps=num_steps, 
-                                              method='powerlaw', 
-                                              alpha=1.5)
-            
-            # Get network spikes (analyze hidden layer activity)
-            spk_rec, mem_rec = forward_pass(net, spike_data)
-            all_spike_data.append(spk_rec)
-        
-        # Concatenate all spike data
-        combined_spikes = torch.cat(all_spike_data, dim=1)  # [time, total_batch, neurons]
-        
-        # Analyze criticality
-        plot_criticality_analysis(combined_spikes, 
-                                title="Power-Law Network Hidden Layer Activity",
-                                save_path="network_criticality.png")
-
-# Simple function to analyze just your encoded input data
-def analyze_input_criticality():
-    """
-    Quick analysis of your power-law encoded input spikes
-    """
-    # Get a batch of test data
-    test_batch = next(iter(test_loader))
-    data, targets = test_batch
-    data = data[:32].to(device)  # Use 32 samples
-    
-    # Power-law encoding
-    powerlaw_spikes = modified_rate_encoding(data.view(data.size(0), -1), 
-                                           num_steps=50,  # More time steps for better analysis
-                                           method='powerlaw', 
-                                           alpha=1.5)
-    
-    # Poisson encoding for comparison
-    poisson_spikes = modified_rate_encoding(data.view(data.size(0), -1), 
-                                          num_steps=50, 
-                                          method='poisson')
-    
-    # Analyze both
-    print("Analyzing INPUT spike patterns...")
-    
-    plot_criticality_analysis(powerlaw_spikes, 
-                            title="Power-Law Input Encoding",
-                            save_path="input_powerlaw_criticality.png")
-    
-    plot_criticality_analysis(poisson_spikes, 
-                            title="Poisson Input Encoding", 
-                            save_path="input_poisson_criticality.png")
-
-# Run the analysis
+# Example usage in main:
 if __name__ == "__main__":
-    # Analyze input encoding criticality
-    analyze_input_criticality()
-    
-    # If you have a trained network, analyze network criticality
-    # evaluate_network_criticality(trained_net, test_loader)
+    # PERFORMANCE EVALUATION
+    trained_network, accuracy = train_population_coding_snn(train_loader, test_loader, device)
