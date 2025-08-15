@@ -30,20 +30,21 @@ test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
 
 
 
-## REQUIRED POPULATION CODING ##
+## REQUIRED POPULATION CODING (relevant for Friday 15 Aug) ##
 
 
+    
 def powerlaw_conv(data, alpha=1.5, min_val=1e-7):
     uniform_random = torch.rand_like(data)
     
     # Generate power-law distributed samples
     powerlaw_samples = (1 - uniform_random) ** (-1/(alpha - 1))
     
-    spike_probability = data * torch.clamp(1.0 / powerlaw_samples, 0, 2)
-    spike_probability = torch.clamp(spike_probability, 0, 1)
-    spike_data = torch.bernoulli(spike_probability)
-
-    return spike_data
+    # Modulate spike probability: scale the data to normalised values that follow PL
+    spike_probability = data / powerlaw_samples 
+    spike_probability = torch.clamp(spike_probability, 0, 1) #Remove values outside [0, 1]
+    
+    return torch.bernoulli(spike_probability)
 
 def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
     """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
@@ -69,6 +70,24 @@ def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
     else:
         raise ValueError(f"Unknown method: {method}")
     return spike_data
+
+## PLOTTING DATA SHAPE (hist) ##
+
+def plot_spike_histogram(spike_data, dt_steps=10, save_path="spike_hist"):
+    
+    counts = spike_data.sum(dim=0).flatten().cpu().numpy()
+    
+    # Plot histogram
+    plt.figure(figsize=(8, 5))
+    plt.hist(counts, bins=int(counts.max()) + 1, density=True, alpha=0.7, edgecolor='black')
+    plt.xlabel(f'Spikes in dt={dt_steps}')
+    plt.ylabel('Probability')
+    plt.title('Spike Count Distribution')
+    plt.axvline(counts.mean(), color='red', linestyle='--', label=f'Mean: {counts.mean():.2f}')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{save_path}.png", dpi=150, bbox_inches='tight')
+    plt.show()
 
 
 ## VISUALISING DATA ##
@@ -132,161 +151,28 @@ print("- 10 Poisson encoding GIFs (poisson_digit_X.gif)")
 print("- 10 Critical encoding GIFs (critical_digit_X.gif)")
 
 
-## PLOTTING DATA SHAPE ##
-
-
-def plot_spike_count_histogram(spike_data, dt_steps=10, title="Spike Count Distribution"):
-    """
-    Plot histogram of spike counts with probability on y-axis.
-    
-    Args:
-        spike_data: Tensor of shape [time_steps, batch_size, neurons]
-        dt_steps: Time interval (number of time steps) to count spikes over
-        title: Plot title
-    """
-    # Sum spikes over the chosen time interval dt
-    # Shape: [time_steps//dt_steps, batch_size, neurons]
-    num_intervals = spike_data.shape[0] // dt_steps
-    
-    # Reshape and sum over dt_steps intervals
-    if num_intervals > 0:
-        # Truncate to fit evenly into intervals
-        truncated_data = spike_data[:num_intervals * dt_steps]
-        reshaped = truncated_data.view(num_intervals, dt_steps, spike_data.shape[1], spike_data.shape[2])
-        spike_counts = reshaped.sum(dim=1)  # Sum over dt_steps dimension
-    else:
-        # If dt_steps >= total time steps, just sum all
-        spike_counts = spike_data.sum(dim=0, keepdim=True)
-    
-    # Flatten to get all spike counts
-    all_counts = spike_counts.flatten().cpu().numpy()
-    
-    # Create histogram with probability density
-    plt.figure(figsize=(10, 6))
-    
-    # Get unique values and their counts
-    unique_counts, frequencies = np.unique(all_counts, return_counts=True)
-    probabilities = frequencies / len(all_counts)
-    
-    # Create bar plot
-    plt.bar(unique_counts, probabilities, alpha=0.7, edgecolor='black', width=0.8)
-    
-    plt.xlabel(f'Number of Spikes in dt = {dt_steps} time steps')
-    plt.ylabel('Probability')
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
-    
-    # Set x-axis to show integer values
-    max_spikes = int(np.max(unique_counts))
-    plt.xticks(range(0, max_spikes + 1))
-    plt.xlim(-0.5, max_spikes + 0.5)
-    plt.ylim(0, 1)
-    
-    # Add statistics
-    mean_spikes = np.mean(all_counts)
-    plt.axvline(mean_spikes, color='red', linestyle='--', 
-                label=f'Mean: {mean_spikes:.2f}')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Print statistics
-    print(f"Mean spikes per dt={dt_steps}: {mean_spikes:.3f}")
-    print(f"Max spikes observed: {max_spikes}")
-    print(f"Total neurons analyzed: {len(all_counts)}")
-
-def compare_encoding_methods():
-        """
-        Compare power-law vs Poisson encoding spike count distributions
-        """
-        # Get one batch of data
-        data_iter = iter(train_loader)
-        data, targets = next(data_iter)
-        data = data.to(device)
-        
-        print(f"Analyzing batch: {data.shape[0]} samples, {data.shape[1:]} image shape")
-        print("=" * 60)
-        
-        num_steps = 10
-        
-        # Generate spike data with both methods
-        print("Generating power-law spike data...")
-        spike_data_pl = modified_rate_encoding(data.view(data.size(0), -1), 
-                                            num_steps=num_steps, 
-                                            method='powerlaw', alpha=1.5)
-        
-        print("Generating Poisson spike data...")
-        spike_data_poisson = modified_rate_encoding(data.view(data.size(0), -1), 
-                                                num_steps=num_steps, 
-                                                method='poisson')
-        
-        print(f"Spike data shape: {spike_data_pl.shape}")
-        
-        # Plot power-law distribution
-        plot_spike_count_histogram(spike_data_pl, 
-                                title="Power-law Encoding (α=1.5) - dt=10")
-        plt.savefig("powerlaw_hist.png")
-        plt.close()
-
-        # Plot Poisson distribution
-        plot_spike_count_histogram(spike_data_poisson,
-                                title="Poisson Encoding - dt=10")
-        plt.savefig("poisson_hist.png")
-        plt.close()
-        
-        # Side-by-side comparison
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # Power-law plot
-        spike_counts_pl = spike_data_pl.sum(dim=0).flatten().cpu().numpy()
-        unique_counts_pl, frequencies_pl = np.unique(spike_counts_pl, return_counts=True)
-        probabilities_pl = frequencies_pl / len(spike_counts_pl)
-        
-        ax1.bar(unique_counts_pl, probabilities_pl, alpha=0.7, color='blue', edgecolor='black', width=0.8)
-        ax1.set_xlabel(f'Number of Spikes in {num_steps} time steps')
-        ax1.set_ylabel('Probability')
-        ax1.set_title('Power-law Encoding (α=1.5)')
-        ax1.grid(True, alpha=0.3)
-        ax1.axvline(np.mean(spike_counts_pl), color='red', linestyle='--', 
-                    label=f'Mean: {np.mean(spike_counts_pl):.2f}')
-        ax1.legend()
-        ax1.set_ylim(0, max(np.max(probabilities_pl), 0.5))
-        
-        # Poisson plot
-        spike_counts_poisson = spike_data_poisson.sum(dim=0).flatten().cpu().numpy()
-        unique_counts_p, frequencies_p = np.unique(spike_counts_poisson, return_counts=True)
-        probabilities_p = frequencies_p / len(spike_counts_poisson)
-        
-        ax2.bar(unique_counts_p, probabilities_p, alpha=0.7, color='green', edgecolor='black', width=0.8)
-        ax2.set_xlabel(f'Number of Spikes in {num_steps} time steps')
-        ax2.set_ylabel('Probability')
-        ax2.set_title('Poisson Encoding')
-        ax2.grid(True, alpha=0.3)
-        ax2.axvline(np.mean(spike_counts_poisson), color='red', linestyle='--', 
-                    label=f'Mean: {np.mean(spike_counts_poisson):.2f}')
-        ax2.legend()
-        ax2.set_ylim(0, max(np.max(probabilities_p), 0.5))
-        
-        plt.tight_layout()
-        plt.savefig("side_by_side_comparison.png")
-        plt.show()
-        plt.close()
-        
-        print("\nComparison Summary:")
-        print(f"Power-law - Mean spikes: {np.mean(spike_counts_pl):.3f}, Std: {np.std(spike_counts_pl):.3f}")
-        print(f"Poisson - Mean spikes: {np.mean(spike_counts_poisson):.3f}, Std: {np.std(spike_counts_poisson):.3f}")
-        
-        # Calculate some interesting statistics
-        zero_spikes_pl = np.sum(spike_counts_pl == 0) / len(spike_counts_pl)
-        zero_spikes_p = np.sum(spike_counts_poisson == 0) / len(spike_counts_poisson)
-        
-        print(f"Power-law - Probability of 0 spikes: {zero_spikes_pl:.3f}")
-        print(f"Poisson - Probability of 0 spikes: {zero_spikes_p:.3f}")
-
 if __name__ == "__main__":
-    compare_encoding_methods()
-    print("Analysis complete.")
+    # Collect data over 10 batches
+    all_data = []
+    all_targets = []
+    
+    data_iter = iter(test_loader)
+    for i in range(10):
+        data, targets = next(data_iter)
+        all_data.append(data)
+        all_targets.append(targets)
+    
+    # Concatenate all batches
+    combined_data = torch.cat(all_data, dim=0)
+    combined_targets = torch.cat(all_targets, dim=0)
+
+    # Optional: generate for specific numbers
+    #mask = (combined_targets == 1)
+    #combined_data = combined_data[mask]
+    
+    # Generate spikes for all data
+    spikes = modified_rate_encoding(combined_data, num_steps=10, method='powerlaw', alpha=1.5)
+    plot_spike_histogram(spikes, dt_steps=1)
 
 
 
