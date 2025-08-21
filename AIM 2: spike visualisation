@@ -33,16 +33,20 @@ test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
 ## REQUIRED POPULATION CODING (relevant for Friday 15 Aug) ##
 
 
+def powerlaw_conv(data, alpha=1.5):
+    """Power-law replacement for torch.bernoulli()"""
+    clipped_data = torch.clamp(data, min=1e-7, max=1)
     
-def powerlaw_conv(data, alpha=1.5, min_val=1e-7):
-    uniform_random = torch.rand_like(data)
+    # Use PyTorch's Pareto distribution
+    from torch.distributions import Pareto
+    pareto_dist = Pareto(scale=1e-7, alpha=alpha-1)  # alpha-1 because Pareto uses different parameterization
     
-    # Generate power-law distributed samples
-    powerlaw_samples = (1 - uniform_random) ** (-1/(alpha - 1))
+    # Sample from power law and use as threshold modulation
+    powerlaw_samples = pareto_dist.sample(clipped_data.shape)
     
-    # Modulate spike probability: scale the data to normalised values that follow PL
-    spike_probability = data / powerlaw_samples 
-    spike_probability = torch.clamp(spike_probability, 0, 1) #Remove values outside [0, 1]
+    # Modulate spike probability
+    spike_probability = clipped_data / powerlaw_samples
+    spike_probability = torch.clamp(spike_probability, 0, 1)
     
     return torch.bernoulli(spike_probability)
 
