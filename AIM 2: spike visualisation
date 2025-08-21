@@ -53,7 +53,6 @@ def powerlaw_conv(data, alpha=1.1, scale_factor=1):
 
     return powerlaw_probs
 
-
 def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
     """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
 
@@ -79,9 +78,50 @@ def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
         raise ValueError(f"Unknown method: {method}")
     return spike_data
 
+def enforce_powerlaw_on_spike_counts(existing_spikes, target_alpha=2.0):
+    """
+    Transform existing spike data to follow power law distribution at the NSpikes level.
+    This enforces power law on the spike counts per sample, not individual spike probabilities.
+    """
+    original_shape = existing_spikes.shape
+    batch_size = original_shape[0]
+    
+    # Calculate current spike counts per sample
+    current_spike_counts = existing_spikes.view(batch_size, -1).sum(dim=1)
+    
+    # Generate power law distributed spike counts
+    pareto_dist = Pareto(scale=1.0, alpha=target_alpha)
+    powerlaw_samples = pareto_dist.sample((batch_size,))
+    
+    # Scale the samples to reasonable spike count range
+    min_spikes = max(1, current_spike_counts.min().item())
+    max_spikes = current_spike_counts.max().item()
+    
+    # Normalize and scale the power law samples to spike count range
+    powerlaw_samples_normalized = (powerlaw_samples - powerlaw_samples.min()) / (powerlaw_samples.max() - powerlaw_samples.min())
+    target_spike_counts = (min_spikes + powerlaw_samples_normalized * (max_spikes - min_spikes)).round().int()
+    
+    # Sort in descending order to create proper power law distribution
+    target_spike_counts, _ = torch.sort(target_spike_counts, descending=True)
+    
+    # Create new spike tensors with target spike counts
+    new_spikes = torch.zeros_like(existing_spikes)
+    
+    for i in range(batch_size):
+        target_count = target_spike_counts[i].item()
+        flat_sample = existing_spikes[i].view(-1)
+        total_neurons = len(flat_sample)
+        
+        if target_count > 0:
+            # Randomly select neurons to spike
+            spike_indices = torch.randperm(total_neurons)[:target_count]
+            flat_new_spikes = torch.zeros(total_neurons)
+            flat_new_spikes[spike_indices] = 1
+            new_spikes[i] = flat_new_spikes.view(existing_spikes[i].shape)
+    
+    return new_spikes
 
 ## VISUALISING DATA ##
-
 
 def plot_spike_histogram(spike_data, save_path="spike_hist", num_steps=10):
     all_ncounts = []
