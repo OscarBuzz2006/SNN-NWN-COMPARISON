@@ -32,43 +32,47 @@ test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
 
 ## REQUIRED POPULATION CODING (relevant for Friday 15 Aug) ##
 
+def powerlaw_conv(data, alpha=1.1, scale_factor=1):
+    # With the very first digit (a 5), we can see that sum (ncounts) is 107841, serving as the reference for the scale factor:
+    #scale_factor=107841*alpha
 
-def powerlaw_conv(data, alpha=1.5):
-    """Power-law replacement for torch.bernoulli()"""
+    #if data.dim() == 3:
+        #data = data.squeeze(0)  # Remove batch dimension if present
+
+    # This Pareto function is a Power Law; creates higher probabilities for lower input values
+    pareto_dist = Pareto(scale=1e-3, alpha=alpha-1) # alpha-1 to mimic PL function based on Pareto parameterisation
     
-    # Use PyTorch's Pareto distribution
-    from torch.distributions import Pareto
-    pareto_dist = Pareto(scale=1e-7, alpha=alpha-1)  # alpha-1 to mimic PL function based on Pareto parameterisation
-    
-    # Sample from power law and use as threshold modulation
+    # Sample from the Pareto distribution
     powerlaw_samples = pareto_dist.sample(data.shape)
-    
-    # Modulate spike probability
-    spike_probability = clipped_data / powerlaw_samples
-    spike_probability = torch.clamp(spike_probability, 0, 1)
-    
-    return torch.bernoulli(spike_probability)
+
+    # Normalize the samples to create a power-law distribution of probabilities
+    powerlaw_probs = torch.clamp((powerlaw_samples)/(powerlaw_samples.max()), 0, 1)
+
+    spike_data = torch.bernoulli(powerlaw_probs)
+
+    return powerlaw_probs
+
 
 def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
     """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
-    
+
     Args:
         data: Input tensor
         num_steps: Number of time steps
         method: 'poisson' (original) or 'powerlaw' (critical)
         **kwargs: Additional arguments for power-law generation
-    
+
     Returns:
         Spike tensor with chosen statistics
     """
     # Repeat data across time dimension
     time_data = data.repeat(tuple([num_steps] + [1] * len(data.shape)))
-    
+
     if method == 'poisson':
         # Original snnTorch behavior
         spike_data = torch.bernoulli(torch.clamp(time_data, 0, 1))
     elif method == 'powerlaw':
-        # Your critical avalanche modification
+        # Power-law encoding
         spike_data = powerlaw_conv(time_data, **kwargs)
     else:
         raise ValueError(f"Unknown method: {method}")
