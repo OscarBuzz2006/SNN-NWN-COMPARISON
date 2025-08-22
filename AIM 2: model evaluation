@@ -1,0 +1,323 @@
+import torch
+import torch.nn as nn
+import snntorch as snn
+from snntorch import surrogate
+from snntorch import functional as SF
+from snntorch import utils
+import numpy as np
+from collections import Counter
+import matplotlib.pyplot as plt
+import powerlaw
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+import torch.distributions.pareto as Pareto
+
+# Testing and training data
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+# Training Parameters
+batch_size=128
+data_path='/tmp/data/mnist'
+num_classes = 10  # MNIST has 10 output classes
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else torch.device("cpu")
+
+transform = transforms.Compose([
+    transforms.Resize((28, 28)),
+    transforms.ToTensor()
+])
+
+mnist_train = datasets.MNIST(data_path, train=True, download=True, transform=transform)
+mnist_test = datasets.MNIST(data_path, train=False, download=True, transform=transform)
+
+train_loader = DataLoader(mnist_train, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(mnist_test, batch_size=batch_size, shuffle=True)
+
+
+## REQUIRED POPULATION CODING ##
+
+def powerlaw_conv(data, alpha=1.1, scale_factor=1):
+    # With the very first digit (a 5), we can see that sum (ncounts) is 107841, serving as the reference for the scale factor:
+    #scale_factor=107841*alpha
+
+    #if data.dim() == 3:
+        #data = data.squeeze(0)  # Remove batch dimension if present
+
+    # This Pareto function is a Power Law; creates higher probabilities for lower input values
+    pareto_dist = Pareto(scale=1e-3, alpha=alpha-1) # alpha-1 to mimic PL function based on Pareto parameterisation
+    
+    # Sample from the Pareto distribution
+    powerlaw_samples = pareto_dist.sample(data.shape)
+
+    # Normalize the samples to create a power-law distribution of probabilities
+    powerlaw_probs = torch.clamp((powerlaw_samples)/(powerlaw_samples.max()), 0, 1)
+
+    spike_data = torch.bernoulli(powerlaw_probs)
+
+    return powerlaw_probs
+
+
+def modified_rate_encoding(data, num_steps=10, method='powerlaw', **kwargs):
+    """Drop-in replacement for snntorch.spikegen.rate() with power-law option.
+
+    Args:
+        data: Input tensor
+        num_steps: Number of time steps
+        method: 'poisson' (original) or 'powerlaw' (critical)
+        **kwargs: Additional arguments for power-law generation
+
+    Returns:
+        Spike tensor with chosen statistics
+    """
+    # Repeat data across time dimension
+    time_data = data.repeat(tuple([num_steps] + [1] * len(data.shape)))
+
+    if method == 'poisson':
+        # Original snnTorch behavior
+        spike_data = torch.bernoulli(torch.clamp(time_data, 0, 1))
+    elif method == 'powerlaw':
+        # Power-law encoding
+        spike_data = powerlaw_conv(time_data, **kwargs)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    return spike_data
+
+##ABOVE IS COPIED FROM SNN_MNIST_samples.PY FOR DATA LOADING AND MODIFICATION; BELOW IS THE CORE SNN TRAINING AND TESTING CODE##
+
+# Test accuracy function FROM SNNTORCH, MODIFIED FOR MANUAL POPULATION CODING
+def test_accuracy(test_loader, net, num_steps, method='poisson', population_code=True, num_classes=10):
+    with torch.no_grad():
+        net.eval()
+        test_acc = []
+        
+        for data, targets in iter(test_loader):
+            data = data.to(device)
+            targets = targets.to(device)
+            
+            # Encoding with configurable method - returns [num_steps, batch_size, features]
+            spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
+                                              num_steps=num_steps, 
+                                              method=method)
+            
+            # Forward pass with proper time-step handling
+            spk_rec, mem_rec = forward_pass(net, spike_data)
+            
+            # Population coding accuracy calculation
+            if population_code:
+                acc = SF.accuracy_rate(spk_rec, targets, population_code=True, num_classes=num_classes)
+            else:
+                acc = SF.accuracy_rate(spk_rec, targets)
+                
+            test_acc.append(acc)
+            
+        net.train()
+        return np.mean(test_acc)
+
+def train_population_coding_snn(train_loader, test_loader, device, method='poisson', num_epochs=5, num_steps=10, num_classes=10):
+    """
+    Train a population coding SNN with configurable encoding method.
+    Functionality includes:
+    - Configurable encoding method (Poisson or Power-law)
+    - Population coding with 500 output neurons (50 per class)
+    - Loss function and optimizer setup
+    - Training loop with logging
+    - Final evaluation on test set
+
+    Returns:
+        - Trained network
+        - Final test accuracy
+    """
+    # Network parameters
+    num_inputs = 28*28
+    num_hidden = 128
+    
+    # Spiking neuron parameters
+    beta = 0.9  # neuron decay rate
+    grad = surrogate.fast_sigmoid()  # surrogate gradient
+    
+    # Population coding setup - 500 output neurons, 50 per class
+    pop_outputs = 500
+    
+    # Build the population coding network
+    net_pop = nn.Sequential(nn.Flatten(),
+                            nn.Linear(num_inputs, num_hidden),
+                            snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True),
+                            nn.Linear(num_hidden, pop_outputs),
+                            snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True, output=True)
+                            ).to(device)
+    
+    utils.reset(net_pop)  # Clear retained hidden states
+    
+    print("Network Architecture:")
+    print(net_pop)
+    print(f"Population coding: {pop_outputs} output neurons, {pop_outputs//num_classes} neurons per class")
+    print(f"Training with {method.upper()} Population Coding")
+    print("="*60)
+
+    # Loss function and optimizer
+    loss_fn = SF.mse_count_loss(correct_rate=1.0, incorrect_rate=0.0,
+                                population_code=True, num_classes=num_classes)
+    optimizer = torch.optim.Adam(net_pop.parameters(), lr=2e-3, betas=(0.9, 0.999))
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        
+        epoch_loss = 0
+        num_batches = 0
+        
+        for batch_idx, (data, targets) in enumerate(train_loader):
+            data = data.to(device)
+            targets = targets.to(device)
+            
+            # Encoding with configurable method - returns [num_steps, batch_size, features]
+            spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
+                                              num_steps=num_steps, 
+                                              method=method)
+            
+            # Forward pass with proper time handling
+            spk_rec, mem_rec = forward_pass(net_pop, spike_data)
+            
+            # Loss calculation - SF.mse_count_loss expects [time, batch, neurons]
+            loss_val = loss_fn(spk_rec, targets)
+            
+            # Backpropagation
+            optimizer.zero_grad()
+            loss_val.backward()
+            optimizer.step()
+            
+            epoch_loss += loss_val.item()
+            num_batches += 1
+            
+            # Print progress every 100 batches
+            if batch_idx % 100 == 0:
+                print(f"  Batch {batch_idx}/{len(train_loader)}, Loss: {loss_val.item():.6f}")
+                
+                #print(f"  Monitoring spikes at epoch {epoch+1}, batch {batch_idx}")
+                # Monitor input spikes
+                #plot_spike_histogram(spike_data.permute(1, 0, 2), 
+                                   #save_path=f"input_spikes_epoch_{epoch+1}_batch_{batch_idx}",
+                                   #num_steps=num_steps)
+                # Monitor output spikes
+                #plot_spike_histogram(spk_rec.permute(1, 0, 2),
+                                   #save_path=f"output_spikes_epoch_{epoch+1}_batch_{batch_idx}",
+                                   #num_steps=num_steps)
+
+        # Calculate average loss for epoch
+        avg_loss = epoch_loss / num_batches
+        
+        # Test accuracy with same encoding method
+        test_acc = test_accuracy(test_loader, net_pop, num_steps, method=method,
+                               population_code=True, num_classes=num_classes)
+        
+        print(f"Average Loss: {avg_loss:.6f}")
+        print(f"Test Accuracy: {test_acc*100:.3f}%")
+        print("-" * 40)
+    
+    print(f"\nTraining with {method.upper()} encoding completed!")
+    
+    # Final evaluation
+    print("\nFinal Results:")
+    final_accuracy = test_accuracy(test_loader, net_pop, num_steps, method=method,
+                                  population_code=True, num_classes=num_classes)
+    print(f"Final Test Accuracy with {method.upper()} Population Coding: {final_accuracy*100:.3f}%")
+    
+    return net_pop, final_accuracy
+
+def forward_pass(net, spike_data):
+    """
+    Forward pass through network handling time dimension properly
+    spike_data shape: [num_steps, batch_size, features]
+    """
+    spk_rec = []
+    mem_rec = []
+    
+    # Initialize hidden states (?)
+    utils.reset(net)
+    
+    # Loop through each time step
+    for step in range(spike_data.size(0)):  # Loop over time dimension
+        spk_out, mem_out = net(spike_data[step])  # Feed [batch_size, features] to network
+        spk_rec.append(spk_out)
+        mem_rec.append(mem_out)
+    
+    return torch.stack(spk_rec), torch.stack(mem_rec)
+
+def generate_confusion_matrix_png(test_loader, net, num_steps, method='poisson', 
+                                save_path='confusion_matrix.png', num_classes=10):
+    """
+    Generate confusion matrix PNG comparing most active 50-neuron class vs true labels.
+    
+    Returns:
+        confusion_matrix: numpy array [true_label, predicted_class]
+    """
+    device = next(net.parameters()).device
+    
+    predicted_classes = []
+    true_labels = []
+    
+    with torch.no_grad():
+        net.eval()
+        
+        for data, targets in test_loader:
+            data = data.to(device)
+            targets = targets.to(device)
+            
+            # Encode data using same method as training
+            spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
+                                              num_steps=num_steps, 
+                                              method=method)
+            
+            # Forward pass
+            spk_rec, mem_rec = forward_pass(net, spike_data)
+            
+            # Sum spikes over time: [batch_size, 500_neurons]
+            total_spikes = torch.sum(spk_rec, dim=0)
+            
+            # Reshape to [batch_size, 10_classes, 50_neurons_per_class]
+            class_spikes = total_spikes.view(total_spikes.size(0), num_classes, 50)
+            
+            # Sum spikes within each class group: [batch_size, 10_classes]
+            class_activity = torch.sum(class_spikes, dim=2)
+            
+            # Most active class is the prediction
+            predictions = torch.argmax(class_activity, dim=1)
+            
+            predicted_classes.extend(predictions.cpu().numpy())
+            true_labels.extend(targets.cpu().numpy())
+    
+    # Create confusion matrix [true_label, predicted_class]
+    cm = np.zeros((num_classes, num_classes), dtype=int)
+    for true_label, predicted_class in zip(true_labels, predicted_classes):
+        cm[true_label, predicted_class] += 1
+    
+    # Create visualization
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=range(num_classes), 
+                yticklabels=range(num_classes))
+    
+    plt.title(f'Confusion Matrix - {method.upper()} Population Coding')
+    plt.xlabel('Predicted Class (Most Active 50-Neuron Group)')
+    plt.ylabel('True Label')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Calculate and print accuracy (diagonal sum / total)
+    accuracy = np.trace(cm) / np.sum(cm)
+    print(f"Confusion matrix saved to: {save_path}")
+    print(f"Accuracy: {accuracy*100:.2f}%")
+    
+    return cm
+
+if __name__ == "__main__":
+    # PERFORMANCE EVALUATION WITH CONFUSION MATRIX
+    # Generate confusion matrix directly
+    net_pop, _ = train_population_coding_snn(train_loader, test_loader, device, method='poisson', num_epochs=2)
+
+    cm = generate_confusion_matrix_png(test_loader, net_pop, num_steps=10, 
+                                     method='poisson', num_classes=10, 
+                                     save_path='results.png')
