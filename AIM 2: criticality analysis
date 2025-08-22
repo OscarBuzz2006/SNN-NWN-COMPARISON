@@ -1,0 +1,63 @@
+## ... Using the same rate encoding and net_pop setup that has been implemented in my other scripts...#
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def detect_avalanches(spike_raster, thresh='mean'):
+    """
+    spike_raster: [T, N] binary spikes from SNN (choose a layer)
+    returns: list of (size, duration)
+    """
+    A = spike_raster.sum(axis=1)           # [T]
+    thr = (A.mean() if thresh=='mean' else thresh)
+    active = A > thr
+
+    sizes, durs = [], []
+    in_burst, start = False, 0
+    for t, on in enumerate(active):
+        if on and not in_burst:
+            in_burst, start = True, t
+        elif not on and in_burst:
+            end = t-1
+            durs.append(end-start+1)
+            sizes.append(int(A[start:end+1].sum()))
+            in_burst = False
+    if in_burst:
+        end = len(A)-1
+        durs.append(end-start+1)
+        sizes.append(int(A[start:end+1].sum()))
+    return np.array(sizes), np.array(durs)
+
+def loglog_plots(sizes, durs, bins=30, title='Avalanche stats'):
+    # Log-binned histogram
+    def log_hist(x):
+        x = x[x > 0]
+        bins = np.logspace(np.log10(x.min()), np.log10(x.max()), bins)
+        hist, edges = np.histogram(x, bins=bins, density=True)
+        centers = np.sqrt(edges[1:] * edges[:-1])
+        return centers, hist
+    
+    cs, hs = log_hist(sizes)
+    cd, hd = log_hist(durs)
+    
+    plt.figure(figsize=(10, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.loglog(cs, hs, 'o')
+    plt.xlabel('Size')
+    plt.ylabel('P(S)')
+    plt.title('Size Distribution')
+    
+    plt.subplot(1, 2, 2)
+    plt.loglog(cd, hd, 'o')
+    plt.xlabel('Duration')
+    plt.ylabel('P(D)')
+    plt.title('Duration Distribution')
+    
+    plt.tight_layout()
+    plt.savefig(f"criticality_loglog.png", dpi=150, bbox_inches='tight')
+    plt.show()
+                    
+if __name__ == "__main__":
+    sizes, durs = detect_avalanches(spikes_out, thresh='mean')
+    loglog_plots(sizes, durs, title='SNN w/ Pareto input')
