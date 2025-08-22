@@ -1,0 +1,23 @@
+def enforce_powerlaw(spike_counts, alpha=2.0, scale=1.0):
+    # Flatten spike counts
+    flat = spike_counts.flatten()
+    n = flat.numel()
+
+    # Sort by rank
+    ranks = torch.argsort(flat)
+
+    # Generate Pareto samples
+    pareto = torch.distributions.pareto.Pareto(scale, alpha)
+    pl_samples = pareto.sample((n,))
+
+    # Sort Pareto samples so they can be mapped by rank
+    pl_samples_sorted, _ = torch.sort(pl_samples)
+
+    # Reassign values so that lowest spike → lowest PL sample, etc.
+    transformed = torch.zeros_like(flat, dtype=torch.float)
+    transformed[ranks] = pl_samples_sorted
+
+    return transformed.view_as(spike_counts)
+
+
+    
