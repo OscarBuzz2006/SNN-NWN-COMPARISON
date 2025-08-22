@@ -3,36 +3,192 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-def detect_avalanches(spike_raster, thresh='mean'):
+def train_population_coding_snn(train_loader, test_loader, device, method='poisson', num_epochs=5, num_steps=10, num_classes=10):
     """
-    spike_raster: [T, N] binary spikes from SNN (choose a layer)
-    returns: list of (size, duration)
+    Train a population coding SNN with configurable encoding method.
+    Functionality includes:
+    - Configurable encoding method (Poisson or Power-law)
+    - Population coding with 500 output neurons (50 per class)
+    - Loss function and optimizer setup
+    - Training loop with logging
+    - Final evaluation on test set
+
+    Returns:
+        - Trained network
+        - Final test accuracy
     """
-    A = spike_raster.sum(axis=1)           # [T]
-    thr = (A.mean() if thresh=='mean' else thresh)
-    active = A > thr
+    # Network parameters
+    num_inputs = 28*28
+    num_hidden = 128
+    
+    # Spiking neuron parameters
+    beta = 0.9  # neuron decay rate
+    grad = surrogate.fast_sigmoid()  # surrogate gradient
+    
+    # Population coding setup - 500 output neurons, 50 per class
+    pop_outputs = 500
+    
+    # Build the population coding network
+    net_pop = nn.Sequential(nn.Flatten(),
+                            nn.Linear(num_inputs, num_hidden),
+                            snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True),
+                            nn.Linear(num_hidden, pop_outputs),
+                            snn.Leaky(beta=beta, spike_grad=grad, init_hidden=True, output=True)
+                            ).to(device)
+    
+    utils.reset(net_pop)  # Clear retained hidden states
+    
+    print("Network Architecture:")
+    print(net_pop)
+    print(f"Population coding: {pop_outputs} output neurons, {pop_outputs//num_classes} neurons per class")
+    print(f"Training with {method.upper()} Population Coding")
+    print("="*60)
 
-    sizes, durs = [], []
-    in_burst, start = False, 0
-    for t, on in enumerate(active):
-        if on and not in_burst:
-            in_burst, start = True, t
-        elif not on and in_burst:
-            end = t-1
-            durs.append(end-start+1)
-            sizes.append(int(A[start:end+1].sum()))
-            in_burst = False
-    if in_burst:
-        end = len(A)-1
-        durs.append(end-start+1)
-        sizes.append(int(A[start:end+1].sum()))
-    return np.array(sizes), np.array(durs)
+    # Loss function and optimizer
+    loss_fn = SF.mse_count_loss(correct_rate=1.0, incorrect_rate=0.0,
+                                population_code=True, num_classes=num_classes)
+    optimizer = torch.optim.Adam(net_pop.parameters(), lr=2e-3, betas=(0.9, 0.999))
+    
+    # Training loop
+# Training loop
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        
+        epoch_loss = 0
+        num_batches = 0
 
-def loglog_plots(sizes, durs, bins=30, title='Avalanche stats'):
+        # Initialize avalanche data collection for this epoch
+        all_sizes = [] 
+        all_durs = []
+        
+        for batch_idx, (data, targets) in enumerate(train_loader):
+            data = data.to(device)
+            targets = targets.to(device)
+            
+            # Encoding with configurable method
+            spike_data = modified_rate_encoding(data.view(data.size(0), -1), 
+                                              num_steps=num_steps, 
+                                              method=method)
+            
+            # Forward pass
+            spk_rec, mem_rec = forward_pass(net_pop, spike_data)
+
+            # Collect avalanche data from this batch
+            sizes, durations = collect_avalanche_data(spk_rec)
+            all_sizes.extend(sizes)
+            all_durs.extend(durations)
+            
+            # Loss calculation and backprop
+            loss_val = loss_fn(spk_rec, targets)
+            optimizer.zero_grad()
+            loss_val.backward()
+            optimizer.step()
+            
+            epoch_loss += loss_val.item()
+            num_batches += 1
+            
+            if batch_idx % 100 == 0:
+                print(f"  Batch {batch_idx}/{len(train_loader)}, Loss: {loss_val.item():.6f}")
+
+        # Plot avalanche statistics at the end of each epoch
+        if len(all_sizes) > 0:
+            print(f"Collected {len(all_sizes)} avalanches in epoch {epoch+1}")
+            loglog_plots(np.array(all_sizes), np.array(all_durs), 
+                        title=f'Epoch {epoch+1} Avalanches')
+
+            
+            # Loss calculation - SF.mse_count_loss expects [time, batch, neurons]
+            loss_val = loss_fn(spk_rec, targets)
+            
+            # Backpropagation
+            optimizer.zero_grad()
+            loss_val.backward()
+            optimizer.step()
+            
+            epoch_loss += loss_val.item()
+            num_batches += 1
+            
+            # Print progress every 100 batches
+            if batch_idx % 100 == 0:
+                print(f"  Batch {batch_idx}/{len(train_loader)}, Loss: {loss_val.item():.6f}")
+                
+                #print(f"  Monitoring spikes at epoch {epoch+1}, batch {batch_idx}")
+                # Monitor input spikes
+                #plot_spike_histogram(spike_data.permute(1, 0, 2), 
+                                   #save_path=f"input_spikes_epoch_{epoch+1}_batch_{batch_idx}",
+                                   #num_steps=num_steps)
+                # Monitor output spikes
+                #plot_spike_histogram(spk_rec.permute(1, 0, 2),
+                                   #save_path=f"output_spikes_epoch_{epoch+1}_batch_{batch_idx}",
+                                   #num_steps=num_steps)
+
+        # Calculate average loss for epoch
+        avg_loss = epoch_loss / num_batches
+        
+        # Test accuracy with same encoding method
+        test_acc = test_accuracy(test_loader, net_pop, num_steps, method=method,
+                               population_code=True, num_classes=num_classes)
+        
+        print(f"Average Loss: {avg_loss:.6f}")
+        print(f"Test Accuracy: {test_acc*100:.3f}%")
+        print("-" * 40)
+    
+    print(f"\nTraining with {method.upper()} encoding completed!")
+    
+    # Final evaluation
+    print("\nFinal Results:")
+    final_accuracy = test_accuracy(test_loader, net_pop, num_steps, method=method,
+                                  population_code=True, num_classes=num_classes)
+    print(f"Final Test Accuracy with {method.upper()} Population Coding: {final_accuracy*100:.3f}%")
+    
+    return net_pop, final_accuracy
+    
+## CRITICALITY ANALYSIS FUNCTIONS - plot the spikes' duration/frequency vs. size##
+
+def collect_avalanche_data(spk_rec, threshold=0.1):
+    """
+    Extract avalanche sizes and durations from SNN spike recordings.
+    
+    Args:
+        spk_rec: Spike recordings tensor [num_steps, batch_size, num_neurons]
+        threshold: Minimum activity level to count as active time step
+    
+    Returns:
+        sizes: Array of avalanche sizes (total spikes)
+        durations: Array of avalanche durations (time steps)
+    """
+    sizes = []
+    durations = []
+    
+    # Sum spikes across batch and neurons for each time step
+    activity = spk_rec.sum(dim=(1, 2)).detach().cpu().numpy()  # [num_steps]
+    
+    # Find avalanches as continuous periods of activity
+    active = activity > threshold
+    
+    if not active.any():
+        return np.array([]), np.array([])
+    
+    # Find avalanche boundaries
+    diff = np.diff(np.concatenate(([False], active, [False])).astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    
+    # Extract size and duration for each avalanche
+    for start, end in zip(starts, ends):
+        size = activity[start:end].sum()  # Total spikes in avalanche
+        duration = end - start  # Time steps
+        
+        sizes.append(size)
+        durations.append(duration)
+    
+    return np.array(sizes), np.array(durations)
+
+def loglog_plots(sizes, durs, num_bins=30, title='Avalanche stats'):
     # Log-binned histogram
     def log_hist(x):
         x = x[x > 0]
-        bins = np.logspace(np.log10(x.min()), np.log10(x.max()), bins)
+        bins = np.logspace(np.log10(x.min()), np.log10(x.max()), num_bins)
         hist, edges = np.histogram(x, bins=bins, density=True)
         centers = np.sqrt(edges[1:] * edges[:-1])
         return centers, hist
@@ -59,5 +215,15 @@ def loglog_plots(sizes, durs, bins=30, title='Avalanche stats'):
     plt.show()
                     
 if __name__ == "__main__":
-    sizes, durs = detect_avalanches(spikes_out, thresh='mean')
-    loglog_plots(sizes, durs, title='SNN w/ Pareto input')
+    # Train the network and collect avalanche data
+    print("Starting SNN training with criticality analysis...")
+    
+    # Train with power-law encoding
+    trained_net, final_accuracy = train_population_coding_snn(
+        train_loader, test_loader, device, 
+        method='poisson',  # Use power-law for criticality
+        num_epochs=1,       # Keep low for testing
+        num_steps=10, 
+        num_classes=10
+    )
+
